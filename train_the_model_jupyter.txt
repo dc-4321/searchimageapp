@@ -1,0 +1,118 @@
+import cv2
+import mediapipe as mp
+import os
+import numpy as np
+import joblib
+from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import SVC
+import torch
+from insightface.app import FaceAnalysis
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+# Initialize Mediapipe Face Detection
+mp_face_detection = mp.solutions.face_detection
+
+# Input and Output folder paths
+input_dataset_folder = "/content/drive/MyDrive/dataset"  # Change to your dataset path
+output_dataset_folder = "/content/cskv"
+
+# Ensure the output dataset folder exists
+os.makedirs(output_dataset_folder, exist_ok=True)
+
+# Set scale factor (Adjust as needed)
+scale_factor = 1.8  # Increase for a bigger face crop, decrease for a tighter crop
+
+# Initialize ArcFace model
+app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+app.prepare(ctx_id=0, det_size=(640, 640))
+
+def apply_augmentation(image):
+    """Applies data augmentation like flipping, brightness, and contrast adjustments."""
+    flipped = cv2.flip(image, 1)  # Horizontal Flip
+    bright = cv2.convertScaleAbs(image, alpha=1.2, beta=10)  # Brightness & Contrast
+    return [image, flipped, bright]
+
+# Function to detect faces using MediaPipe
+def detect_faces(image, face_detection):
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = face_detection.process(image_rgb)
+    return results
+
+# Lists to store embeddings and labels
+embeddings = []
+labels = []
+
+# Initialize Mediapipe Face Detection
+with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+    for person_name in os.listdir(input_dataset_folder):
+        person_folder = os.path.join(input_dataset_folder, person_name)
+        if not os.path.isdir(person_folder):
+            continue
+
+        for image_name in os.listdir(person_folder):
+            image_path = os.path.join(person_folder, image_name)
+
+            # Read the image
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"Could not read the image: {image_path}")
+                continue
+
+            # Detect faces
+            results = detect_faces(image, face_detection)
+
+            # Process detected faces
+            if results.detections:
+                for idx, detection in enumerate(results.detections):
+                    bboxC = detection.location_data.relative_bounding_box
+                    ih, iw, _ = image.shape
+                    x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), int(bboxC.width * iw), int(bboxC.height * iw)
+
+                    # Apply scaling to adjust face crop
+                    cx, cy = x + w // 2, y + h // 2
+                    new_w, new_h = int(w * scale_factor), int(h * scale_factor)
+                    x1, y1, x2, y2 = max(0, cx - new_w // 2), max(0, cy - new_h // 2), min(iw, cx + new_w // 2), min(ih, cy + new_h // 2)
+
+                    # Ensure the cropped region is valid
+                    if x2 - x1 <= 0 or y2 - y1 <= 0:
+                        print(f"Invalid crop for {image_name}. Skipping...")
+                        continue
+
+                    # Crop face
+                    cropped_face = image[y1:y2, x1:x2]
+
+                    # Save cropped face
+                    output_path = os.path.join(output_dataset_folder, f"{os.path.splitext(image_name)[0]}_face{idx}.jpg")
+                    cv2.imwrite(output_path, cropped_face)
+                    print(f"Cropped face saved at: {output_path}")
+
+                    # Apply Data Augmentation
+                    augmented_faces = apply_augmentation(cropped_face)
+
+                    for aug_face in augmented_faces:
+                        face_img = cv2.cvtColor(aug_face, cv2.COLOR_BGR2RGB)
+                        face_img = np.asarray(face_img)
+                        faces = app.get(face_img)
+                        if faces:
+                            embedding = faces[0].embedding
+                            embedding = embedding / np.linalg.norm(embedding)  # L2 Normalize
+                            embeddings.append(embedding)
+                            labels.append(person_name)
+            else:
+                print(f"No faces detected in {image_name}.")
+
+# Encode labels
+label_encoder = LabelEncoder()
+encoded_labels = label_encoder.fit_transform(labels)
+
+# Train SVM Classifier with Hyperparameter Tuning
+param_grid = {'C': [0.1, 1, 10, 100], 'gamma': ['scale', 'auto']}
+svm = SVC(kernel='linear', probability=True)
+clf = GridSearchCV(svm, param_grid, cv=5, verbose=1, n_jobs=-1)
+clf.fit(embeddings, encoded_labels)
+
+# Save the model and label encoder
+joblib.dump({'model': clf.best_estimator_, 'label_encoder': label_encoder}, 'csk31face.joblib')
+print("Model saved as csk31face.joblib")
